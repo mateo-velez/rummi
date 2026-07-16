@@ -11,7 +11,7 @@ class Tile {
 }
 
 class GameState {
-  constructor(playerIds) {
+  constructor(playerIds, options = {}) {
     this.playerIds = playerIds; // array of socket ids
     this.deck = this.generateDeck();
     this.racks = {}; // { playerId: [Tile] }
@@ -33,6 +33,12 @@ class GameState {
     for (let id of playerIds) {
       this.initialMeldCompleted[id] = false;
     }
+    this.turnTimeout = options.turnTimeout || 0; // 0 = no timeout
+    this.turnStartTime = Date.now();
+  }
+
+  startTurnTimer() {
+    this.turnStartTime = Date.now();
   }
 
   generateDeck() {

@@ -1,16 +1,29 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
+// Generate a persistent ID for reconnection
+const getPersistentId = () => {
+  let id = localStorage.getItem('rummi-pid');
+  if (!id) {
+    id = 'p-' + Math.random().toString(36).substring(2, 12);
+    localStorage.setItem('rummi-pid', id);
+  }
+  return id;
+};
+
 export default function Home({ socket }) {
   const { roomCode: urlRoomCode } = useParams();
   const navigate = useNavigate();
-  const [name, setName] = useState('');
+  const [name, setName] = useState(localStorage.getItem('rummi-name') || '');
   const [roomCode, setRoomCode] = useState(urlRoomCode || '');
-  const [avatar, setAvatar] = useState('🦊'); // Default simple avatar
+  const [avatar, setAvatar] = useState(localStorage.getItem('rummi-avatar') || '🦊');
+
+  const saveName = (n) => { setName(n); localStorage.setItem('rummi-name', n); };
+  const saveAvatar = (a) => { setAvatar(a); localStorage.setItem('rummi-avatar', a); };
 
   const handleCreate = () => {
     if (!name) return alert('Please enter a name');
-    socket.emit('createRoom', { name, avatar }, (response) => {
+    socket.emit('createRoom', { name, avatar, persistentId: getPersistentId() }, (response) => {
       if (response.success) {
         navigate(`/room/${response.roomCode}`);
       }
@@ -20,7 +33,7 @@ export default function Home({ socket }) {
   const handleJoin = () => {
     if (!name) return alert('Please enter a name');
     if (!roomCode) return alert('Please enter a room code');
-    socket.emit('joinRoom', { roomCode: roomCode.toUpperCase(), name, avatar }, (response) => {
+    socket.emit('joinRoom', { roomCode: roomCode.toUpperCase(), name, avatar, persistentId: getPersistentId() }, (response) => {
       if (response.success) {
         navigate(`/room/${roomCode.toUpperCase()}`);
       } else {
@@ -40,7 +53,7 @@ export default function Home({ socket }) {
             type="text" 
             placeholder="Enter your name..." 
             value={name} 
-            onChange={e => setName(e.target.value)} 
+            onChange={e => saveName(e.target.value)} 
           />
         </div>
 
@@ -50,7 +63,7 @@ export default function Home({ socket }) {
             {['🦊', '🐼', '🐯', '🐸', '🦄'].map(emoji => (
               <div 
                 key={emoji}
-                onClick={() => setAvatar(emoji)}
+                onClick={() => saveAvatar(emoji)}
                 style={{
                   cursor: 'pointer',
                   padding: '0.5rem',
