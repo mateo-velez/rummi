@@ -24,7 +24,7 @@ Instructions and guidelines for AI coding agents working on the **Rummi** codeba
 
 ### 4. Rack Auto-Sorting & Sort Preference
 - User rack sorting preference (`rackSortType`: `'number'` | `'color'`) must be preserved across server state broadcasts.
-- When `myRack` updates from server broadasts, re-apply `rackSortType` in a `useEffect` without causing infinite state render loops (compare JSON stringified tile IDs before emitting updates).
+- When `myRack` updates from server broadcasts, re-apply `rackSortType` in a `useEffect` (or via `useRackSort` hook) without causing infinite state render loops (compare JSON stringified tile IDs before emitting updates).
 - Manual drag-and-drop within the rack sets `rackSortType` to `null` to respect the user's custom manual ordering.
 
 ### 5. Swapping Restrictions
@@ -43,10 +43,23 @@ Instructions and guidelines for AI coding agents working on the **Rummi** codeba
 
 ## Important Files Reference
 
+### Backend
 - [`server/game/RummikubLogic.js`](file:///home/mateo/Workspace/rummi/server/game/RummikubLogic.js): Deck generator, board validation (`validateSet`, `isBoardValid`), game state snapshot creation and revert logic.
 - [`server/server.js`](file:///home/mateo/Workspace/rummi/server/server.js): Socket event handling, turn timer management, room state broadcasting, player reconnection migration.
-- [`client/src/pages/Room.jsx`](file:///home/mateo/Workspace/rummi/client/src/pages/Room.jsx): Main game page component containing tile selection state, click/drag handlers, set insertion/splitting, and layout.
+
+### Frontend
+- [`client/src/pages/Room.jsx`](file:///home/mateo/Workspace/rummi/client/src/pages/Room.jsx): Main game coordinator page combining state hooks and subcomponents.
 - [`client/src/pages/Home.jsx`](file:///home/mateo/Workspace/rummi/client/src/pages/Home.jsx): Room creation, joining, persistent identity management, avatar selection.
+- [`client/src/hooks/`](file:///home/mateo/Workspace/rummi/client/src/hooks/): React custom hooks:
+  - `useGameSocket.js`: Encapsulates Socket.io room events (`roomUpdate`, `boardSync`, `reaction`).
+  - `useTurnTimer.js`: Calculates active turn countdown timers.
+  - `useRackSort.js`: Manages user rack auto-sorting preferences (Rule #4).
+- [`client/src/components/`](file:///home/mateo/Workspace/rummi/client/src/components/): Modular UI components:
+  - `Board.jsx`, `TileSet.jsx`, `Rack.jsx`, `GameHeader.jsx`, `GameControls.jsx`, `Lobby.jsx`, `Tile.jsx`, `ReactionPicker.jsx`, `FloatingReactions.jsx`, `ErrorMessage.jsx`.
+- [`client/src/utils/`](file:///home/mateo/Workspace/rummi/client/src/utils/): Pure utility modules:
+  - `gameUtils.js`: Deep cloning (`cloneBoard`), auto-sorting sets (`autoSortSet`), rack sorting (`sortRackTiles`), empty set cleanup.
+  - `persistentId.js`: LocalStorage persistent ID utility (`getPersistentId`).
+  - `constants.js`: System constants (`REACTION_EMOJIS`).
 
 ---
 
@@ -58,3 +71,4 @@ When adding new features or fixing bugs:
 3. Verify `endTurn`, `undo`, `revertTurn`, and `drawTile` flows.
 4. Verify turn timer expiration triggers auto-revert and auto-draw.
 5. Verify browser refresh / reconnect restores hand and room state.
+6. Verify linter (`npm --prefix client run lint`) and build (`npm --prefix client run build`) pass cleanly.

@@ -67,8 +67,10 @@ Open `http://localhost:5173` in your browser.
 rummi/
 ├── client/                 # React + Vite Frontend
 │   ├── src/
-│   │   ├── components/     # Tile & UI components
-│   │   ├── pages/          # Home (Lobby) & Room (Gameplay)
+│   │   ├── components/     # Modular UI Components (Board, TileSet, Rack, GameHeader, etc.)
+│   │   ├── hooks/          # Custom React Hooks (useGameSocket, useTurnTimer, useRackSort)
+│   │   ├── pages/          # Home (Lobby) & Room (Game Coordinator)
+│   │   ├── utils/          # Pure Utilities (gameUtils, persistentId, constants)
 │   │   ├── App.jsx         # Socket initialization & Router
 │   │   └── index.css       # Design system & Animations
 │   └── vite.config.js
@@ -92,7 +94,7 @@ rummi/
 
 We welcome contributions! Please follow these guidelines:
 
-1. **State Immutability**: Always deep-clone board state and rack arrays before mutating (`cloneBoard` helper in `Room.jsx`). Direct mutation of React or server state causes state desynchronization bugs.
+1. **State Immutability**: Always deep-clone board state and rack arrays before mutating (`cloneBoard` helper in `gameUtils.js`). Direct mutation of React or server state causes state desynchronization bugs.
 2. **Prevent Event Bubbling**: Always call `e.stopPropagation()` when interacting with individual tiles or sets to avoid accidental parent board click triggers.
 3. **Socket Protocol Rules**: All state-modifying actions must be broadcasted via Socket.io events (`boardSync`, `roomUpdate`). See [`docs/SOCKET_PROTOCOL.md`](docs/SOCKET_PROTOCOL.md) for full event definitions.
 4. **Code Style**: Keep CSS cleanly organized in `index.css` using modern design tokens (variables, glassmorphism, fluid layouts).

@@ -26,7 +26,31 @@ This document describes the high-level system architecture, client-server commun
 
 ---
 
-## 2. In-Memory Data Models
+## 2. Frontend Modular Architecture
+
+The frontend follows a modular, single-responsibility directory structure:
+
+- **`pages/`**: View container / layout orchestrators.
+  - `Room.jsx`: Top-level game coordinator delegating to hooks, components, and socket handlers.
+  - `Home.jsx`: Landing page for creating/joining rooms and configuring player avatars.
+- **`hooks/`**: Custom React hooks encapsulating stateful side effects.
+  - `useGameSocket.js`: Handles Socket.io event listeners (`roomUpdate`, `boardSync`, `reaction`).
+  - `useTurnTimer.js`: Calculates active turn countdowns.
+  - `useRackSort.js`: Manages user rack auto-sorting preferences without infinite render loops.
+- **`components/`**: Focused, presentational UI subcomponents.
+  - `Board.jsx` & `TileSet.jsx`: Board container, sets, gaps, and set-level click/drag handlers.
+  - `Rack.jsx`: Rack area displaying player tiles and sorting controls.
+  - `GameHeader.jsx` & `GameControls.jsx`: Turn action bar, timer badges, player badges, and room metadata.
+  - `Lobby.jsx`: Pre-game waiting room interface.
+  - `ReactionPicker.jsx` & `FloatingReactions.jsx`: Emoji reactions selector and floating animation overlay.
+  - `ErrorMessage.jsx`: Toast banner for invalid turn errors.
+- **`utils/`**: Pure functions for data transformation and side-effect free helpers.
+  - `gameUtils.js`: Deep cloning (`cloneBoard`), auto-sorting tile runs/groups (`autoSortSet`), and sorting rack tiles.
+  - `persistentId.js`: LocalStorage player identity management.
+
+---
+
+## 3. In-Memory Data Models
 
 The backend manages rooms in an in-memory dictionary `rooms`:
 
@@ -65,7 +89,7 @@ rooms = {
 
 ---
 
-## 3. Session Reconnection Flow
+## 4. Session Reconnection Flow
 
 To prevent accidental room abandonment when a player closes their tab or loses network connectivity:
 
@@ -81,7 +105,7 @@ To prevent accidental room abandonment when a player closes their tab or loses n
 
 ---
 
-## 4. Real-Time Synchronization Patterns
+## 5. Real-Time Synchronization Patterns
 
 - **Full Broadcast (`roomUpdate`)**: Emitted whenever room configurations change, a player joins/leaves, game starts, or turn ends.
 - **Local Turn Broadcast (`boardSync`)**: Sent only to opponents during an active turn (`socket.to(roomCode).emit('boardSync', ...)`) to display real-time moves without committing backend snapshots.

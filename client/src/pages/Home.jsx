@@ -1,15 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
-
-// Generate a persistent ID for reconnection
-const getPersistentId = () => {
-  let id = localStorage.getItem('rummi-pid');
-  if (!id) {
-    id = 'p-' + Math.random().toString(36).substring(2, 12);
-    localStorage.setItem('rummi-pid', id);
-  }
-  return id;
-};
+import { getPersistentId } from '../utils/persistentId';
 
 export default function Home({ socket }) {
   const { roomCode: urlRoomCode } = useParams();

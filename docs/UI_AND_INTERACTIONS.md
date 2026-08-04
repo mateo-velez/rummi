@@ -4,7 +4,21 @@ This document documents the user interface design, visual layout, tile interacti
 
 ---
 
-## 1. Interaction Models
+## 1. Modular Component Structure
+
+The game UI is divided into reusable presentational components and state hooks:
+
+- **`GameHeader`**: Displays room code, online/offline player status badges, hand sizes, turn timer badge, and reaction picker trigger.
+- **`Board`**: Render region for the game board, handling empty board clicks/drops and the "+ New Set" action.
+- **`TileSet`**: Handles rendering individual sets, tile gaps, drag/drop insertion, set splitting (`splitSet`), and set click selection.
+- **`Rack`**: Displays player tiles, handles rack drag-and-drop reordering, and integrates the `GameControls` bar.
+- **`GameControls`**: Action button bar providing Undo, Sort Sets, Draw Tile, Revert All, End Turn, and Sort 123/Color options.
+- **`Lobby`**: Waiting room view for room settings (turn timer configuration for host) and player listing prior to game start.
+- **`FloatingReactions` & `ReactionPicker`**: Real-time animated emoji reactions.
+
+---
+
+## 2. Interaction Models
 
 Rummi supports dual interaction paradigms: **Click-to-Move** and **Drag & Drop**.
 
@@ -33,11 +47,11 @@ Rummi supports dual interaction paradigms: **Click-to-Move** and **Drag & Drop**
    - Hovering between two tiles in a run reveals a `tile-gap` insertion dropzone.
    - Dropping a tile directly onto the gap inserts the tile precisely into that position in the run.
 3. **Manual Rack Reordering**:
-   - Dragging a tile over another tile inside your rack swaps their positions.
+   - Dragging a tile over another tile inside your rack swaps their positions and sets `rackSortType = null`.
 
 ---
 
-## 2. Set Splitting Mechanics
+## 3. Set Splitting Mechanics
 
 - On any board set containing 2 or more tiles, hovering between tiles reveals a `tile-gap` line.
 - **Clicking the gap**: Instantly splits the set into two independent sets at that index:
@@ -50,20 +64,20 @@ Rummi supports dual interaction paradigms: **Click-to-Move** and **Drag & Drop**
 
 ---
 
-## 3. Auto-Sorting & Rack Preference Persistence
+## 4. Auto-Sorting & Rack Preference Persistence
 
-- **Rack Sort Controls**: Buttons in the rack header allow sorting by `123` (Number) or `Color`.
+- **Rack Sort Controls**: Buttons in `GameControls` allow sorting by `123` (Number) or `Color`.
 - **Sort Logic**:
   - `By 123`: Primary sort by tile number (1-13), secondary by color. Jokers placed at the end.
   - `By Color`: Primary sort by color (`black`, `blue`, `red`, `orange`), secondary by number. Jokers placed at the end.
 - **Persistence**:
-  - `rackSortType` is remembered in state.
-  - When drawing tiles or ending turns, incoming rack updates are automatically re-sorted to match `rackSortType`.
+  - `rackSortType` is remembered in state and managed by `useRackSort`.
+  - When drawing tiles or receiving room state updates, incoming rack updates are automatically re-sorted to match `rackSortType`.
   - Performing manual drag-and-drop tile reordering inside the rack sets `rackSortType = null` to respect user's manual arrangement.
 
 ---
 
-## 4. Visual Aesthetics & Design System
+## 5. Visual Aesthetics & Design System
 
 - **Glassmorphism**: Backdrop blur (`backdrop-filter: blur(12px)`), subtle translucent surfaces, translucent borders.
 - **Distinct Colors**: Modern HSL-tuned color palette for tiles (`black`, `#2563eb` blue, `#dc2626` red, `#f97316` orange).
