@@ -18,6 +18,7 @@ export default function Room({ socket }) {
   const [turnTimeLeft, setTurnTimeLeft] = useState(null);
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [lobbyTimeout, setLobbyTimeout] = useState(0);
+  const [rackSortType, setRackSortType] = useState(null);
   const reactionIdRef = useRef(0);
 
   useEffect(() => {
@@ -74,6 +75,35 @@ export default function Room({ socket }) {
     const interval = setInterval(updateTimer, 500);
     return () => clearInterval(interval);
   }, [gameState?.turnStartTime, gameState?.turnTimeout]);
+
+  // Auto-sort rack if preference is set
+  useEffect(() => {
+    if (!rackSortType || !gameState || !gameState.racks[socket.id]) return;
+    const currentRack = gameState.racks[socket.id];
+    if (currentRack.length === 0) return;
+
+    let sorted = [...currentRack];
+    if (rackSortType === 'number') {
+      sorted.sort((a, b) => {
+        if (a.isJoker) return 1;
+        if (b.isJoker) return -1;
+        if (a.number === b.number) return a.color.localeCompare(b.color);
+        return a.number - b.number;
+      });
+    } else {
+      sorted.sort((a, b) => {
+        if (a.isJoker) return 1;
+        if (b.isJoker) return -1;
+        if (a.color === b.color) return a.number - b.number;
+        return a.color.localeCompare(b.color);
+      });
+    }
+    
+    // Only update if order changed to prevent infinite loops
+    if (JSON.stringify(currentRack.map(t=>t.id)) !== JSON.stringify(sorted.map(t=>t.id))) {
+      syncRackLocal(sorted);
+    }
+  }, [gameState?.racks?.[socket.id], rackSortType]);
 
   const startGame = () => {
     socket.emit('startGame', { roomCode });
@@ -197,6 +227,11 @@ export default function Room({ socket }) {
         }
         // If we click a rack tile while having board tiles selected, or vice versa: swap if exactly 1
         if (selectedTiles.length === 1) {
+          if (firstSel.source !== source) {
+            // Cannot swap between rack and board
+            setSelectedTiles([{ ...tile, source, setIdx }]);
+            return;
+          }
           if (!isMyTurn && (source === 'board' || firstSel.source === 'board')) {
             setSelectedTiles([{ ...tile, source, setIdx }]);
             return;
@@ -350,18 +385,15 @@ export default function Room({ socket }) {
         if (!actualTargetTile) return;
 
         if (draggedTile.source === 'rack') {
+          setRackSortType(null); // Clear auto-sort when manually dragging in rack
           const idx1 = newRack.findIndex(t => t.id === draggedTile.id);
           const idx2 = newRack.findIndex(t => t.id === targetTile.id);
           newRack[idx1] = actualTargetTile;
           newRack[idx2] = actualDraggedTile;
           syncRackLocal(newRack);
         } else {
-          newBoard[draggedTile.setIdx] = newBoard[draggedTile.setIdx].filter(t => t.id !== draggedTile.id);
-          const rIdx = newRack.findIndex(t => t.id === targetTile.id);
-          newRack[rIdx] = actualDraggedTile;
-          newBoard[draggedTile.setIdx].push(actualTargetTile);
-          newBoard[draggedTile.setIdx] = autoSortSet(newBoard[draggedTile.setIdx]);
-          syncLocalMove(newBoard, newRack);
+          // Can't swap board to rack
+          return;
         }
       } else {
         if (draggedTile.source === 'rack') {
@@ -505,6 +537,7 @@ export default function Room({ socket }) {
   };
 
   const sortRack = (type) => {
+    setRackSortType(type);
     let newRack = [...gameState.racks[socket.id]];
     if (type === 'number') {
       newRack.sort((a, b) => {
@@ -603,7 +636,7 @@ export default function Room({ socket }) {
   const currentPlayerId = gameState.playerIds[gameState.currentTurnIndex];
 
   return (
-    <div className="game-container" style={{ flexDirection: 'row' }}>
+    <div className="game-container" style={{ flexDirection: 'column' }}>
       {/* Floating reactions */}
       <div style={{ position: 'fixed', top: '80px', right: '20px', zIndex: 999, display: 'flex', flexDirection: 'column', gap: '0.5rem', pointerEvents: 'none' }}>
         {reactions.map(r => (
@@ -633,59 +666,52 @@ export default function Room({ socket }) {
         </div>
       )}
 
-      {/* LEFT SIDEBAR — Turn Controls */}
-      <div style={{ 
-        display: 'flex', flexDirection: 'column', gap: '0.5rem', 
-        padding: '0.75rem', minWidth: '130px', maxWidth: '140px',
-        flexShrink: 0
-      }}>
-        <div className="glass" style={{ padding: '0.75rem', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
-          <h4 style={{ margin: 0, fontSize: '0.8rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Room {roomCode}</h4>
-          {players.map(p => (
-            <div key={p.id} style={{ 
-              display: 'flex', alignItems: 'center', gap: '0.4rem',
-              opacity: currentPlayerId === p.id ? 1 : (p.offline ? 0.3 : 0.6),
-              padding: '0.3rem',
-              background: currentPlayerId === p.id ? 'var(--surface)' : 'transparent',
-              borderRadius: '6px', fontSize: '0.85rem'
-            }}>
-              <span>{p.avatar}</span>
-              <div style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
-                <span style={{ fontWeight: 'bold', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {p.name} {p.offline ? '📴' : ''}
-                </span>
-                <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>{gameState.racks[p.id]?.length} tiles</span>
-              </div>
-            </div>
-          ))}
-          {turnTimeLeft !== null && turnTimeLeft > 0 && (
-            <div style={{ 
-              textAlign: 'center', fontSize: '1.2rem', fontWeight: 'bold',
-              color: turnTimeLeft <= 10 ? 'var(--color-red)' : 'var(--text)',
-              padding: '0.3rem', borderRadius: '6px',
-              background: turnTimeLeft <= 10 ? 'rgba(220,38,38,0.15)' : 'transparent',
-              animation: turnTimeLeft <= 5 ? 'pulse 1s infinite' : 'none'
-            }}>
-              ⏱️ {turnTimeLeft}s
-            </div>
-          )}
-        </div>
+      {/* TOP HEADER */}
+      <div className="glass" style={{ display: 'flex', gap: '1rem', padding: '0.5rem 1rem', alignItems: 'center', overflowX: 'auto' }}>
+        <h4 style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Room {roomCode}</h4>
+        
+        {players.map(p => (
+          <div key={p.id} style={{ 
+            display: 'flex', alignItems: 'center', gap: '0.4rem',
+            opacity: currentPlayerId === p.id ? 1 : (p.offline ? 0.3 : 0.6),
+            padding: '0.2rem 0.5rem',
+            background: currentPlayerId === p.id ? 'var(--surface)' : 'transparent',
+            borderRadius: '6px', fontSize: '0.85rem'
+          }}>
+            <span>{p.avatar}</span>
+            <span style={{ fontWeight: 'bold' }}>{p.name} {p.offline ? '📴' : ''}</span>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>({gameState.racks[p.id]?.length})</span>
+          </div>
+        ))}
+
+        {turnTimeLeft !== null && turnTimeLeft > 0 && (
+          <div style={{ 
+            marginLeft: 'auto',
+            fontSize: '1.1rem', fontWeight: 'bold',
+            color: turnTimeLeft <= 10 ? 'var(--color-red)' : 'var(--text)',
+            padding: '0.2rem 0.5rem', borderRadius: '6px',
+            background: turnTimeLeft <= 10 ? 'rgba(220,38,38,0.15)' : 'transparent',
+            animation: turnTimeLeft <= 5 ? 'pulse 1s infinite' : 'none'
+          }}>
+            ⏱️ {turnTimeLeft}s
+          </div>
+        )}
 
         {/* Reaction picker */}
-        <div className="glass" style={{ padding: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.3rem' }}>
+        <div style={{ position: 'relative', marginLeft: turnTimeLeft !== null ? '0' : 'auto' }}>
           <button 
             onClick={() => setShowReactionPicker(!showReactionPicker)}
-            style={{ padding: '0.3rem', fontSize: '0.8rem', background: 'var(--surface-border)', color: 'var(--text)' }}
+            style={{ padding: '0.3rem 0.6rem', fontSize: '0.8rem', background: 'var(--surface-border)', color: 'var(--text)' }}
           >
             😄 React
           </button>
           {showReactionPicker && (
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '2px' }}>
+            <div className="glass" style={{ position: 'absolute', top: '100%', right: 0, marginTop: '0.5rem', zIndex: 100, display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '4px', padding: '0.5rem' }}>
               {REACTION_EMOJIS.map(emoji => (
                 <button 
                   key={emoji} 
                   onClick={() => sendReaction(emoji)}
-                  style={{ padding: '0.3rem', fontSize: '1.2rem', background: 'var(--surface)', minWidth: 0 }}
+                  style={{ padding: '0.4rem', fontSize: '1.2rem', background: 'var(--surface)', minWidth: 0 }}
                 >
                   {emoji}
                 </button>
@@ -693,126 +719,122 @@ export default function Room({ socket }) {
             </div>
           )}
         </div>
+      </div>
 
-        {isMyTurn && (
-          <div className="glass" style={{ padding: '0.5rem', display: 'flex', flexDirection: 'column', gap: '0.4rem' }}>
-            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Actions</span>
-            {moveHistory.length > 0 && (
-              <button onClick={undoMove} style={{ padding: '0.4rem', fontSize: '0.75rem', background: 'var(--color-blue)' }}>↩ Undo</button>
-            )}
-            <button onClick={sortBoard} style={{ padding: '0.4rem', fontSize: '0.75rem', background: 'var(--surface-border)', color: 'var(--text)' }}>Sort Sets</button>
-            <button onClick={drawTile} style={{ padding: '0.4rem', fontSize: '0.75rem', background: 'var(--surface)' }}>Draw Tile</button>
-            <button onClick={revertTurn} style={{ padding: '0.4rem', fontSize: '0.75rem', background: 'var(--color-orange)' }}>Revert All</button>
-            <button onClick={endTurn} style={{ padding: '0.4rem', fontSize: '0.75rem', background: 'var(--primary)' }}>End Turn</button>
+      {/* BOARD AREA */}
+      <div 
+        className="board-area glass" 
+        style={{ position: 'relative', flex: 1, minHeight: '300px' }}
+        onDragOver={handleDragOver}
+        onDrop={handleDropOnBoardEmpty}
+        onClick={handleBoardClick}
+      >
+        {gameState.board.length === 0 && <p style={{ margin: 'auto', color: 'var(--text-muted)', pointerEvents: 'none' }}>Board is empty</p>}
+        {gameState.board.map((set, idx) => (
+          <div 
+            key={idx} 
+            className="tile-set"
+            onClick={(e) => { e.stopPropagation(); handleSetClick(idx); }}
+            onDragOver={handleDragOver}
+            onDrop={(e) => handleDropOnSet(e, idx)}
+            style={{ 
+              cursor: selectedTiles.length > 0 && isMyTurn ? 'copy' : 'default',
+              border: selectedTiles.length > 0 && isMyTurn ? '1px dashed var(--primary)' : '1px solid transparent',
+              display: 'flex', alignItems: 'center',
+              padding: '16px 24px',
+              margin: '4px',
+              minHeight: '60px',
+              minWidth: '60px',
+              background: 'rgba(255, 255, 255, 0.03)',
+              borderRadius: '12px'
+            }}
+          >
+            {set.map((tile, tIdx) => (
+              <div key={tile.id} style={{ display: 'flex', alignItems: 'center' }}>
+                <Tile 
+                  tile={tile} 
+                  selected={!!selectedTiles.find(t => t.id === tile.id)}
+                  onClick={(e) => handleTileClick(e, tile, 'board', idx)} 
+                  onDragStart={(e) => handleDragStart(e, tile, 'board', idx)}
+                  onDragOver={handleDragOver}
+                  onDrop={(e) => handleDropOnTile(e, tile, 'board', idx)}
+                />
+                {tIdx < set.length - 1 && isMyTurn && (
+                  <div 
+                    className="tile-gap"
+                    onClick={(e) => splitSet(e, idx, tIdx)}
+                    onDragOver={handleDragOver}
+                    onDrop={(e) => handleDropInGap(e, idx, tIdx)}
+                    title="Click to split, drop here to insert"
+                  ></div>
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+        {isMyTurn && selectedTiles.length > 0 && (
+          <div 
+            onClick={(e) => { e.stopPropagation(); moveSelectedTilesToSet(null); }}
+            style={{
+              padding: '1rem',
+              border: '2px dashed var(--color-orange)',
+              borderRadius: '8px',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              cursor: 'pointer',
+              color: 'var(--color-orange)',
+              fontWeight: 'bold',
+              minWidth: '100px',
+              height: '60px'
+            }}
+          >
+            + New Set
           </div>
         )}
       </div>
 
-      {/* MAIN AREA */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '0.75rem', minWidth: 0, padding: '0.75rem 0.75rem 0.75rem 0' }}>
-        {/* Board */}
-        <div 
-          className="board-area glass" 
-          style={{ position: 'relative', flex: 1 }}
-          onDragOver={handleDragOver}
-          onDrop={handleDropOnBoardEmpty}
-          onClick={handleBoardClick}
-        >
-          {gameState.board.length === 0 && <p style={{ margin: 'auto', color: 'var(--text-muted)', pointerEvents: 'none' }}>Board is empty</p>}
-          {gameState.board.map((set, idx) => (
-            <div 
-              key={idx} 
-              className="tile-set"
-              onClick={(e) => { e.stopPropagation(); handleSetClick(idx); }}
-              onDragOver={handleDragOver}
-              onDrop={(e) => handleDropOnSet(e, idx)}
-              style={{ 
-                cursor: selectedTiles.length > 0 && isMyTurn ? 'copy' : 'default',
-                border: selectedTiles.length > 0 && isMyTurn ? '1px dashed var(--primary)' : '1px solid transparent',
-                display: 'flex', alignItems: 'center',
-                padding: '16px 24px',
-                margin: '4px',
-                minHeight: '60px',
-                minWidth: '60px',
-                background: 'rgba(255, 255, 255, 0.03)',
-                borderRadius: '12px'
-              }}
-            >
-              {set.map((tile, tIdx) => (
-                <div key={tile.id} style={{ display: 'flex', alignItems: 'center' }}>
-                  <Tile 
-                    tile={tile} 
-                    selected={!!selectedTiles.find(t => t.id === tile.id)}
-                    onClick={(e) => handleTileClick(e, tile, 'board', idx)} 
-                    onDragStart={(e) => handleDragStart(e, tile, 'board', idx)}
-                    onDragOver={handleDragOver}
-                    onDrop={(e) => handleDropOnTile(e, tile, 'board', idx)}
-                  />
-                  {tIdx < set.length - 1 && isMyTurn && (
-                    <div 
-                      className="tile-gap"
-                      onClick={(e) => splitSet(e, idx, tIdx)}
-                      onDragOver={handleDragOver}
-                      onDrop={(e) => handleDropInGap(e, idx, tIdx)}
-                      title="Click to split, drop here to insert"
-                    ></div>
-                  )}
-                </div>
-              ))}
-            </div>
-          ))}
-          {isMyTurn && selectedTiles.length > 0 && (
-            <div 
-              onClick={(e) => { e.stopPropagation(); moveSelectedTilesToSet(null); }}
-              style={{
-                padding: '1rem',
-                border: '2px dashed var(--color-orange)',
-                borderRadius: '8px',
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                cursor: 'pointer',
-                color: 'var(--color-orange)',
-                fontWeight: 'bold',
-                minWidth: '100px',
-                height: '60px'
-              }}
-            >
-              + New Set
+      {/* RACK & CONTROLS */}
+      <div className="glass" style={{ display: 'flex', flexDirection: 'column' }}>
+        <div style={{ padding: '0.5rem 1rem', display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'center', background: 'rgba(0,0,0,0.2)', borderTopLeftRadius: '16px', borderTopRightRadius: '16px' }}>
+          <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Sort:</span>
+          <button onClick={() => sortRack('number')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>123</button>
+          <button onClick={() => sortRack('color')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>Color</button>
+          {selectedTiles.length > 0 && (
+            <button onClick={() => setSelectedTiles([])} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'rgba(220,38,38,0.3)' }}>
+              Clear Selection ({selectedTiles.length})
+            </button>
+          )}
+
+          {isMyTurn && (
+            <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
+              {moveHistory.length > 0 && (
+                <button onClick={undoMove} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--color-blue)' }}>↩ Undo</button>
+              )}
+              <button onClick={sortBoard} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)', color: 'var(--text)' }}>Sort Sets</button>
+              <button onClick={drawTile} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface)' }}>Draw Tile</button>
+              <button onClick={revertTurn} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--color-orange)' }}>Revert All</button>
+              <button onClick={endTurn} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--primary)' }}>End Turn</button>
             </div>
           )}
         </div>
-
-        {/* Rack */}
-        <div className="glass" style={{ display: 'flex', flexDirection: 'column' }}>
-          <div style={{ padding: '0.5rem 1rem', display: 'flex', gap: '1rem', background: 'rgba(0,0,0,0.2)', borderTopLeftRadius: '16px', borderTopRightRadius: '16px' }}>
-            <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)', margin: 'auto 0' }}>Sort Rack:</span>
-            <button onClick={() => sortRack('number')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>By 123</button>
-            <button onClick={() => sortRack('color')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>By Color</button>
-            {selectedTiles.length > 0 && (
-              <button onClick={() => setSelectedTiles([])} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'rgba(220,38,38,0.3)', marginLeft: 'auto' }}>
-                Clear Selection ({selectedTiles.length})
-              </button>
-            )}
-          </div>
-          <div 
-            className="rack-area" 
-            style={{ flexWrap: 'wrap', height: 'auto', minHeight: '120px' }}
-            onDragOver={handleDragOver}
-            onDrop={(e) => {}}
-          >
-            {myRack.map(tile => (
-              <Tile 
-                key={tile.id} 
-                tile={tile} 
-                selected={!!selectedTiles.find(t => t.id === tile.id)}
-                onClick={(e) => handleTileClick(e, tile, 'rack')} 
-                onDragStart={(e) => handleDragStart(e, tile, 'rack')}
-                onDragOver={handleDragOver}
-                onDrop={(e) => handleDropOnTile(e, tile, 'rack')}
-              />
-            ))}
-          </div>
+        <div 
+          className="rack-area" 
+          style={{ flexWrap: 'wrap', height: 'auto', minHeight: '120px' }}
+          onDragOver={handleDragOver}
+          onDrop={(e) => {}}
+        >
+          {myRack.map(tile => (
+            <Tile 
+              key={tile.id} 
+              tile={tile} 
+              selected={!!selectedTiles.find(t => t.id === tile.id)}
+              onClick={(e) => handleTileClick(e, tile, 'rack')} 
+              onDragStart={(e) => handleDragStart(e, tile, 'rack')}
+              onDragOver={handleDragOver}
+              onDrop={(e) => handleDropOnTile(e, tile, 'rack')}
+            />
+          ))}
         </div>
       </div>
     </div>

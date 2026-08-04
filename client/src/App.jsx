@@ -5,8 +5,9 @@ import Home from './pages/Home';
 import Room from './pages/Room';
 import './index.css';
 
-// Connect to the local server
-const socket = io('http://localhost:3001');
+// Connect to the server
+const serverUrl = import.meta.env.PROD ? undefined : 'http://localhost:3001';
+const socket = io(serverUrl);
 
 function App() {
   const [isConnected, setIsConnected] = useState(socket.connected);

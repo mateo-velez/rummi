@@ -1,11 +1,19 @@
 const express = require('express');
 const http = require('http');
+const path = require('path');
 const { Server } = require('socket.io');
 const cors = require('cors');
 const { GameState } = require('./game/RummikubLogic');
 
 const app = express();
 app.use(cors());
+
+// Serve built React client in production
+if (process.env.NODE_ENV === 'production') {
+  const publicDir = path.join(__dirname, 'public');
+  app.use(express.static(publicDir));
+  app.get('*', (_, res) => res.sendFile(path.join(publicDir, 'index.html')));
+}
 
 const server = http.createServer(app);
 const io = new Server(server, {
