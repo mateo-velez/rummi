@@ -1,4 +1,4 @@
-# Rummikub Web Application
+# Vibe Coded Rummikub Web Application
 
 A modern, real-time multiplayer Rummikub web application built with **React**, **Node.js**, **Socket.io**, and **Vite**. 
 
