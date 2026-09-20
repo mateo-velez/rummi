@@ -32,7 +32,7 @@ export default function Board({
 
       {board && board.map((set, idx) => (
         <TileSet 
-          key={idx}
+          key={set.length > 0 ? set.map(t => t.id).join('-') : idx}
           set={set}
           setIdx={idx}
           selectedTiles={selectedTiles}

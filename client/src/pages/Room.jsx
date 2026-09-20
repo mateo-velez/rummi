@@ -6,10 +6,10 @@ import Board from '../components/Board';
 import Rack from '../components/Rack';
 import ErrorMessage from '../components/ErrorMessage';
 import FloatingReactions from '../components/FloatingReactions';
+import WinScreen from '../components/WinScreen';
 
 import { useGameSocket } from '../hooks/useGameSocket';
 import { useTurnTimer } from '../hooks/useTurnTimer';
-import { useRackSort } from '../hooks/useRackSort';
 
 import { cloneBoard, autoSortSet, removeEmptySets, sortRackTiles } from '../utils/gameUtils';
 
@@ -20,7 +20,6 @@ export default function Room({ socket }) {
   const [selectedTiles, setSelectedTiles] = useState([]);
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const [lobbyTimeout, setLobbyTimeout] = useState(0);
-  const [rackSortType, setRackSortType] = useState(null);
 
   // Socket state hook
   const {
@@ -29,7 +28,9 @@ export default function Room({ socket }) {
     gameState,
     setGameState,
     config,
-    reactions
+    reactions,
+    gameOverInfo,
+    setGameOverInfo
   } = useGameSocket(socket);
 
   // Turn countdown hook
@@ -45,9 +46,6 @@ export default function Room({ socket }) {
     }));
     socket.emit('updateRack', { roomCode, rack: newRack });
   };
-
-  // Enforce auto-sorting preference on rack (Rule #4)
-  useRackSort(gameState, socket, rackSortType, syncRackLocal);
 
   const pushHistory = (board, rack) => {
     setMoveHistory(prev => [...prev, {
@@ -69,6 +67,11 @@ export default function Room({ socket }) {
 
   const startGame = () => {
     socket.emit('startGame', { roomCode });
+  };
+
+  const restartGame = () => {
+    socket.emit('restartGame', { roomCode });
+    setGameOverInfo(null);
   };
 
   const updateConfig = (key, value) => {
@@ -276,7 +279,6 @@ export default function Room({ socket }) {
         if (!actualTargetTile) return;
 
         if (draggedTile.source === 'rack') {
-          setRackSortType(null); // Clear auto-sort when manually dragging in rack (Rule #4)
           const idx1 = newRack.findIndex(t => t.id === draggedTile.id);
           const idx2 = newRack.findIndex(t => t.id === targetTile.id);
           newRack[idx1] = actualTargetTile;
@@ -428,7 +430,6 @@ export default function Room({ socket }) {
   };
 
   const sortRack = (type) => {
-    setRackSortType(type);
     const sortedRack = sortRackTiles(gameState.racks[socket.id], type);
     syncRackLocal(sortedRack);
   };
@@ -539,6 +540,14 @@ export default function Room({ socket }) {
         onDragOver={handleDragOver}
         onDropOnTile={handleDropOnTile}
       />
+
+      {gameOverInfo && (
+        <WinScreen
+          winner={gameOverInfo.winner}
+          isHost={socket.id === host}
+          onPlayAgain={restartGame}
+        />
+      )}
     </div>
   );
 }

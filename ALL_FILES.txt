@@ -1,0 +1,1616 @@
+const express = require('express');
+const http = require('http');
+const path = require('path');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const { GameState } = require('./game/RummikubLogic');
+
+const app = express();
+app.use(cors());
+
+// Serve built React client in production
+if (process.env.NODE_ENV === 'production') {
+  const publicDir = path.join(__dirname, 'public');
+  app.use(express.static(publicDir));
+  app.get('*', (_, res) => res.sendFile(path.join(publicDir, 'index.html')));
+}
+
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+// In-memory state
+const rooms = {};
+
+const generateRoomCode = () => {
+  return Math.random().toString(36).substring(2, 6).toUpperCase();
+};
+
+// Turn timeout management
+const turnTimers = {}; // { roomCode: timeoutId }
+
+const clearTurnTimer = (roomCode) => {
+  if (turnTimers[roomCode]) {
+    clearTimeout(turnTimers[roomCode]);
+    delete turnTimers[roomCode];
+  }
+};
+
+const startTurnTimer = (roomCode) => {
+  clearTurnTimer(roomCode);
+  const room = rooms[roomCode];
+  if (!room || !room.gameState || !room.gameState.turnTimeout) return;
+
+  const timeout = room.gameState.turnTimeout * 1000;
+  room.gameState.startTurnTimer();
+
+  turnTimers[roomCode] = setTimeout(() => {
+    const gs = room.gameState;
+    if (!gs) return;
+    // Auto-revert and draw
+    gs.revertToSnapshot();
+    const tile = gs.drawTile();
+    if (tile) {
+      gs.racks[gs.getCurrentPlayerId()].push(tile);
+    }
+    gs.nextTurn();
+    gs.createSnapshot();
+    startTurnTimer(roomCode);
+    broadcastRoom(roomCode);
+  }, timeout);
+};
+
+const broadcastRoom = (roomCode) => {
+  const room = rooms[roomCode];
+  if (room) {
+    io.to(roomCode).emit('roomUpdate', {
+      players: Object.values(room.players),
+      host: room.host,
+      gameState: room.gameState,
+      config: room.config
+    });
+  }
+};
+
+io.on('connection', (socket) => {
+  console.log('A user connected:', socket.id);
+
+  socket.on('createRoom', (data, callback) => {
+    const { name, avatar } = data;
+    const roomCode = generateRoomCode();
+
+    rooms[roomCode] = {
+      host: socket.id,
+      players: {
+        [socket.id]: { id: socket.id, name, avatar, persistentId: data.persistentId || socket.id }
+      },
+      gameState: null,
+      config: { turnTimeout: 0 },
+      // Track persistent IDs for reconnection
+      persistentMap: {} // { persistentId: socketId }
+    };
+    if (data.persistentId) {
+      rooms[roomCode].persistentMap[data.persistentId] = socket.id;
+    }
+
+    socket.join(roomCode);
+    console.log(`Room created: ${roomCode} by ${socket.id}`);
+
+    callback({ success: true, roomCode });
+    broadcastRoom(roomCode);
+  });
+
+  socket.on('updateConfig', ({ roomCode, config }) => {
+    const room = rooms[roomCode];
+    if (room && room.host === socket.id && !room.gameState) {
+      room.config = { ...room.config, ...config };
+      broadcastRoom(roomCode);
+    }
+  });
+
+  socket.on('joinRoom', (data, callback) => {
+    const { roomCode, name, avatar, persistentId } = data;
+
+    if (!rooms[roomCode]) {
+      callback({ success: false, message: 'Room not found' });
+      return;
+    }
+
+    const room = rooms[roomCode];
+
+    // Check if this is a reconnection
+    if (persistentId && room.persistentMap[persistentId]) {
+      const oldSocketId = room.persistentMap[persistentId];
+
+      // If there's game state, migrate the old socket ID to the new one
+      if (room.gameState) {
+        const gs = room.gameState;
+
+        // Migrate rack
+        if (gs.racks[oldSocketId]) {
+          gs.racks[socket.id] = gs.racks[oldSocketId];
+          delete gs.racks[oldSocketId];
+        }
+
+        // Migrate playerIds array
+        const pidx = gs.playerIds.indexOf(oldSocketId);
+        if (pidx !== -1) {
+          gs.playerIds[pidx] = socket.id;
+        }
+
+        // Migrate initialMeldCompleted
+        if (gs.initialMeldCompleted[oldSocketId] !== undefined) {
+          gs.initialMeldCompleted[socket.id] = gs.initialMeldCompleted[oldSocketId];
+          delete gs.initialMeldCompleted[oldSocketId];
+        }
+
+        // Migrate snapshot rack if it belongs to the reconnecting player
+        if (gs.snapshot && gs.snapshot.rackPlayerId === oldSocketId) {
+          gs.snapshot.rackPlayerId = socket.id;
+        }
+
+        // Migrate winner
+        if (gs.winner === oldSocketId) {
+          gs.winner = socket.id;
+        }
+      }
+
+      // Remove old player entry
+      delete room.players[oldSocketId];
+      if (room.host === oldSocketId) {
+        room.host = socket.id;
+      }
+
+      // Update persistent map
+      room.persistentMap[persistentId] = socket.id;
+    } else if (persistentId) {
+      room.persistentMap[persistentId] = socket.id;
+    }
+
+    room.players[socket.id] = { id: socket.id, name, avatar, persistentId: persistentId || socket.id };
+    socket.join(roomCode);
+    console.log(`User ${socket.id} joined room: ${roomCode}`);
+
+    callback({ success: true, reconnected: !!(persistentId && room.gameState) });
+    broadcastRoom(roomCode);
+  });
+
+  socket.on('startGame', ({ roomCode }) => {
+    const room = rooms[roomCode];
+    if (room && room.host === socket.id) {
+      room.gameState = new GameState(Object.keys(room.players), { turnTimeout: room.config.turnTimeout });
+      room.gameState.createSnapshot();
+      broadcastRoom(roomCode);
+      startTurnTimer(roomCode);
+    }
+  });
+
+  socket.on('updateBoardLocal', ({ roomCode, board, rack }) => {
+    const room = rooms[roomCode];
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+      room.gameState.board = board;
+      room.gameState.racks[socket.id] = rack;
+      socket.to(roomCode).emit('boardSync', { board, turnOf: socket.id });
+    }
+  });
+
+  socket.on('updateRack', ({ roomCode, rack }) => {
+    const room = rooms[roomCode];
+    if (room && room.gameState && room.gameState.racks[socket.id]) {
+      room.gameState.racks[socket.id] = rack;
+    }
+  });
+
+  socket.on('revertTurn', ({ roomCode }) => {
+    const room = rooms[roomCode];
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+      room.gameState.revertToSnapshot();
+      broadcastRoom(roomCode);
+    }
+  });
+
+  socket.on('endTurn', ({ roomCode }, callback) => {
+    const room = rooms[roomCode];
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+      const gs = room.gameState;
+      const validation = GameState.isBoardValid(gs.board);
+      if (validation.valid) {
+        const boardUnchanged = JSON.stringify(gs.board) === JSON.stringify(gs.snapshot.board);
+        const rackUnchanged = JSON.stringify(gs.racks[socket.id]) === JSON.stringify(gs.snapshot.rack);
+        if (boardUnchanged && rackUnchanged) {
+          const newTile = gs.drawTile();
+          if (newTile) {
+            gs.racks[socket.id].push(newTile);
+          }
+        }
+
+        if (gs.racks[socket.id].length === 0) {
+          gs.winner = socket.id;
+          clearTurnTimer(roomCode);
+        } else {
+          gs.nextTurn();
+          gs.createSnapshot();
+          startTurnTimer(roomCode);
+        }
+        broadcastRoom(roomCode);
+        if (callback) callback({ success: true });
+      } else {
+        if (callback) callback({ success: false, message: 'Invalid board: ' + validation.error });
+      }
+    }
+  });
+
+  socket.on('drawTile', ({ roomCode }) => {
+    const room = rooms[roomCode];
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+      room.gameState.revertToSnapshot();
+      const tile = room.gameState.drawTile();
+      if (tile) {
+        room.gameState.racks[socket.id].push(tile);
+      }
+      room.gameState.nextTurn();
+      room.gameState.createSnapshot();
+      startTurnTimer(roomCode);
+      broadcastRoom(roomCode);
+    }
+  });
+
+  // Emoji reactions
+  socket.on('reaction', ({ roomCode, emoji }) => {
+    const room = rooms[roomCode];
+    if (room && room.players[socket.id]) {
+      const player = room.players[socket.id];
+      io.to(roomCode).emit('reaction', {
+        playerId: socket.id,
+        playerName: player.name,
+        playerAvatar: player.avatar,
+        emoji
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('User disconnected:', socket.id);
+    for (const roomCode in rooms) {
+      if (rooms[roomCode].players[socket.id]) {
+        const room = rooms[roomCode];
+        const player = room.players[socket.id];
+
+        // If game is in progress, keep the player data but mark offline
+        if (room.gameState) {
+          player.offline = true;
+          // Don't delete — they can reconnect
+          broadcastRoom(roomCode);
+        } else {
+          // No game yet, remove normally
+          delete room.players[socket.id];
+
+          if (Object.keys(room.players).length === 0) {
+            clearTurnTimer(roomCode);
+            delete rooms[roomCode];
+            console.log(`Room ${roomCode} deleted (empty)`);
+          } else {
+            if (room.host === socket.id) {
+              room.host = Object.keys(room.players)[0];
+            }
+            broadcastRoom(roomCode);
+          }
+        }
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3001;
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+const COLORS = ['black', 'blue', 'red', 'orange'];
+const NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+
+class Tile {
+  constructor(id, color, number, isJoker = false) {
+    this.id = id;
+    this.color = color;
+    this.number = number;
+    this.isJoker = isJoker;
+  }
+}
+
+class GameState {
+  constructor(playerIds, options = {}) {
+    this.playerIds = playerIds; // array of socket ids
+    this.deck = this.generateDeck();
+    this.racks = {}; // { playerId: [Tile] }
+    this.board = []; // Array of sets, where each set is an Array of Tiles
+    
+    // Initialize racks
+    for (let id of playerIds) {
+      this.racks[id] = [];
+      for (let i = 0; i < 14; i++) {
+        this.racks[id].push(this.drawTile());
+      }
+    }
+    
+    this.currentTurnIndex = 0;
+    this.snapshot = null;
+    this.winner = null;
+    // Track if a player has made their initial 30 point meld
+    this.initialMeldCompleted = {};
+    for (let id of playerIds) {
+      this.initialMeldCompleted[id] = false;
+    }
+    this.turnTimeout = options.turnTimeout || 0; // 0 = no timeout
+    this.turnStartTime = Date.now();
+  }
+
+  startTurnTimer() {
+    this.turnStartTime = Date.now();
+  }
+
+  generateDeck() {
+    let deck = [];
+    let idCounter = 1;
+    // 2 sets of tiles
+    for (let set = 0; set < 2; set++) {
+      for (let color of COLORS) {
+        for (let number of NUMBERS) {
+          deck.push(new Tile(`t-${idCounter++}`, color, number));
+        }
+      }
+    }
+    // 2 Jokers
+    deck.push(new Tile(`j-1`, null, null, true));
+    deck.push(new Tile(`j-2`, null, null, true));
+    
+    // Shuffle
+    for (let i = deck.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    return deck;
+  }
+
+  drawTile() {
+    if (this.deck.length === 0) return null;
+    return this.deck.pop();
+  }
+
+  getCurrentPlayerId() {
+    return this.playerIds[this.currentTurnIndex];
+  }
+
+  nextTurn() {
+    this.currentTurnIndex = (this.currentTurnIndex + 1) % this.playerIds.length;
+    this.snapshot = null;
+  }
+
+  createSnapshot() {
+    // Deep clone the board and current player's rack
+    this.snapshot = {
+      board: JSON.parse(JSON.stringify(this.board)),
+      rack: JSON.parse(JSON.stringify(this.racks[this.getCurrentPlayerId()]))
+    };
+  }
+
+  revertToSnapshot() {
+    if (this.snapshot) {
+      this.board = JSON.parse(JSON.stringify(this.snapshot.board));
+      this.racks[this.getCurrentPlayerId()] = JSON.parse(JSON.stringify(this.snapshot.rack));
+      // Do not clear the snapshot, allowing multiple reverts in a turn
+    }
+  }
+
+  // Validate if a single set is a valid run or group
+  static validateSet(set) {
+    if (!set || set.length < 3) return { valid: false, error: 'Sets must have at least 3 tiles.' };
+
+    const realTiles = set.filter(t => !t.isJoker);
+    if (realTiles.length === 0) return { valid: true }; 
+    
+    const isGroup = realTiles.every(t => t.number === realTiles[0].number);
+    if (isGroup) {
+      if (set.length > 4) return { valid: false, error: 'A group can have a maximum of 4 tiles.' };
+      const colors = new Set();
+      for (let tile of realTiles) {
+        if (colors.has(tile.color)) return { valid: false, error: `Duplicate color (${tile.color}) in a group of ${tile.number}s.` };
+        colors.add(tile.color);
+      }
+      return { valid: true };
+    }
+
+    const isRunColor = realTiles.every(t => t.color === realTiles[0].color);
+    if (!isRunColor) return { valid: false, error: 'Tiles in a run must be the same color, or tiles in a group must be the same number.' };
+
+    let currentNumber = -1;
+    for (let i = 0; i < set.length; i++) {
+      let tile = set[i];
+      if (tile.isJoker) {
+        if (currentNumber !== -1) currentNumber++;
+      } else {
+        if (currentNumber !== -1 && tile.number !== currentNumber + 1) {
+          return { valid: false, error: `Invalid sequence in run: ${currentNumber} followed by ${tile.number}.` };
+        }
+        currentNumber = tile.number;
+      }
+    }
+    
+    let firstRealIdx = set.findIndex(t => !t.isJoker);
+    if (firstRealIdx === -1) return { valid: true };
+    
+    let expectedStart = set[firstRealIdx].number - firstRealIdx;
+    if (expectedStart < 1 || expectedStart + set.length - 1 > 13) return { valid: false, error: 'Run goes out of bounds (below 1 or above 13).' };
+
+    for (let i = 0; i < set.length; i++) {
+      if (!set[i].isJoker && set[i].number !== expectedStart + i) return { valid: false, error: 'Invalid run sequence.' };
+    }
+    
+    return { valid: true };
+  }
+
+  // Validates the entire board
+  static isBoardValid(board) {
+    for (let set of board) {
+      const result = this.validateSet(set);
+      if (!result.valid) return result;
+    }
+    return { valid: true };
+  }
+}
+
+module.exports = { GameState, Tile };
+import { useState } from 'react';
+import { useParams } from 'react-router-dom';
+import Lobby from '../components/Lobby';
+import GameHeader from '../components/GameHeader';
+import Board from '../components/Board';
+import Rack from '../components/Rack';
+import ErrorMessage from '../components/ErrorMessage';
+import FloatingReactions from '../components/FloatingReactions';
+
+import { useGameSocket } from '../hooks/useGameSocket';
+import { useTurnTimer } from '../hooks/useTurnTimer';
+import { useRackSort } from '../hooks/useRackSort';
+
+import { cloneBoard, autoSortSet, removeEmptySets, sortRackTiles } from '../utils/gameUtils';
+
+export default function Room({ socket }) {
+  const { roomCode } = useParams();
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [moveHistory, setMoveHistory] = useState([]);
+  const [selectedTiles, setSelectedTiles] = useState([]);
+  const [showReactionPicker, setShowReactionPicker] = useState(false);
+  const [lobbyTimeout, setLobbyTimeout] = useState(0);
+  const [rackSortType, setRackSortType] = useState(null);
+
+  // Socket state hook
+  const {
+    players,
+    host,
+    gameState,
+    setGameState,
+    config,
+    reactions
+  } = useGameSocket(socket);
+
+  // Turn countdown hook
+  const turnTimeLeft = useTurnTimer(gameState);
+
+  const isMyTurn = gameState && gameState.playerIds[gameState.currentTurnIndex] === socket.id;
+
+  // Sync local rack update helper
+  const syncRackLocal = (newRack) => {
+    setGameState(prev => ({
+      ...prev,
+      racks: { ...prev.racks, [socket.id]: newRack }
+    }));
+    socket.emit('updateRack', { roomCode, rack: newRack });
+  };
+
+  // Enforce auto-sorting preference on rack (Rule #4)
+  useRackSort(gameState, socket, rackSortType, syncRackLocal);
+
+  const pushHistory = (board, rack) => {
+    setMoveHistory(prev => [...prev, {
+      board: cloneBoard(board),
+      rack: [...rack]
+    }]);
+  };
+
+  const syncLocalMove = (newBoard, newRack) => {
+    pushHistory(gameState.board, gameState.racks[socket.id]);
+    
+    setGameState(prev => ({
+      ...prev,
+      board: newBoard,
+      racks: { ...prev.racks, [socket.id]: newRack }
+    }));
+    socket.emit('updateBoardLocal', { roomCode, board: newBoard, rack: newRack });
+  };
+
+  const startGame = () => {
+    socket.emit('startGame', { roomCode });
+  };
+
+  const updateConfig = (key, value) => {
+    socket.emit('updateConfig', { roomCode, config: { [key]: value } });
+  };
+
+  const sortBoard = () => {
+    if (!isMyTurn) return;
+    const newBoard = gameState.board.map(set => autoSortSet([...set]));
+    syncLocalMove(newBoard, gameState.racks[socket.id]);
+  };
+
+  const undoMove = () => {
+    if (moveHistory.length === 0) return;
+    const historyCopy = [...moveHistory];
+    const previousState = historyCopy.pop();
+    setMoveHistory(historyCopy);
+    
+    setGameState(prev => ({
+      ...prev,
+      board: previousState.board,
+      racks: { ...prev.racks, [socket.id]: previousState.rack }
+    }));
+    socket.emit('updateBoardLocal', { roomCode, board: previousState.board, rack: previousState.rack });
+    setSelectedTiles([]);
+  };
+
+  // --- CLICK HANDLERS ---
+  const handleTileClick = (e, tile, source, setIdx = null) => {
+    e.stopPropagation(); // Rule #2
+    
+    if (!isMyTurn && source === 'board') return;
+
+    const isSelected = selectedTiles.find(t => t.id === tile.id);
+    
+    if (isSelected) {
+      setSelectedTiles(prev => prev.filter(t => t.id !== tile.id));
+      return;
+    }
+
+    // If we have selected tiles, clicking a tile in a DIFFERENT location should ADD them there
+    if (selectedTiles.length > 0) {
+      const firstSel = selectedTiles[0];
+      const sameLocation = firstSel.source === source && firstSel.setIdx === setIdx;
+
+      if (!sameLocation && isMyTurn) {
+        // If selected tiles are from rack/board and we click on a board set → add them to that set
+        if (source === 'board' && setIdx !== null) {
+          moveSelectedTilesToSet(setIdx);
+          return;
+        }
+        // If we click a rack tile while having board tiles selected, or vice versa: swap if exactly 1
+        if (selectedTiles.length === 1) {
+          if (firstSel.source !== source) {
+            // Cannot swap between rack and board (Rule #5)
+            setSelectedTiles([{ ...tile, source, setIdx }]);
+            return;
+          }
+          if (!isMyTurn && (source === 'board' || firstSel.source === 'board')) {
+            setSelectedTiles([{ ...tile, source, setIdx }]);
+            return;
+          }
+          performSwap(selectedTiles[0], { ...tile, source, setIdx });
+          return;
+        } else {
+          // Multi-select from different source: reset selection
+          setSelectedTiles([{ ...tile, source, setIdx }]);
+          return;
+        }
+      }
+    }
+
+    // Add to selection (same source)
+    setSelectedTiles(prev => [...prev, { ...tile, source, setIdx }]);
+  };
+
+  const performSwap = (t1, t2) => {
+    const newBoard = cloneBoard(gameState.board);
+    let newRack = [...gameState.racks[socket.id]];
+
+    const replaceTile = (tInfo, newTile) => {
+      if (tInfo.source === 'rack') {
+        const idx = newRack.findIndex(t => t.id === tInfo.id);
+        newRack[idx] = newTile;
+      } else {
+        const idx = newBoard[tInfo.setIdx].findIndex(t => t.id === tInfo.id);
+        newBoard[tInfo.setIdx][idx] = newTile;
+      }
+    };
+
+    const actualTile1 = t1.source === 'rack' 
+      ? newRack.find(t => t.id === t1.id) 
+      : newBoard[t1.setIdx]?.find(t => t.id === t1.id);
+      
+    const actualTile2 = t2.source === 'rack'
+      ? newRack.find(t => t.id === t2.id)
+      : newBoard[t2.setIdx]?.find(t => t.id === t2.id);
+
+    if (!actualTile1 || !actualTile2) return;
+
+    replaceTile(t1, actualTile2);
+    replaceTile(t2, actualTile1);
+
+    if (t1.source === 'rack' && t2.source === 'rack') {
+      syncRackLocal(newRack);
+    } else {
+      syncLocalMove(newBoard, newRack);
+    }
+    setSelectedTiles([]);
+  };
+
+  const handleSetClick = (setIdx) => {
+    if (!isMyTurn || selectedTiles.length === 0) return;
+    if (selectedTiles.every(t => t.source === 'board' && t.setIdx === setIdx)) return;
+    moveSelectedTilesToSet(setIdx);
+  };
+
+  const handleBoardClick = (e) => {
+    if (!isMyTurn || selectedTiles.length === 0) return;
+    if (e.target !== e.currentTarget) return;
+    moveSelectedTilesToSet(null);
+  };
+
+  const moveSelectedTilesToSet = (targetSetIdx) => {
+    if (!isMyTurn || selectedTiles.length === 0) return;
+
+    const newBoard = cloneBoard(gameState.board);
+    let newRack = [...gameState.racks[socket.id]];
+
+    const actualTilesToMove = selectedTiles.map(sel => {
+      if (sel.source === 'rack') {
+        return newRack.find(t => t.id === sel.id);
+      } else {
+        return newBoard[sel.setIdx]?.find(t => t.id === sel.id);
+      }
+    }).filter(Boolean);
+
+    selectedTiles.forEach(sel => {
+      if (sel.source === 'rack') {
+        newRack = newRack.filter(t => t.id !== sel.id);
+      } else {
+        newBoard[sel.setIdx] = newBoard[sel.setIdx].filter(t => t.id !== sel.id);
+      }
+    });
+
+    // Clean up empty sets and adjust target index
+    for (let i = newBoard.length - 1; i >= 0; i--) {
+      if (newBoard[i].length === 0) {
+        newBoard.splice(i, 1);
+        if (targetSetIdx !== null && targetSetIdx > i) {
+          targetSetIdx--; 
+        }
+      }
+    }
+
+    if (targetSetIdx !== null && newBoard[targetSetIdx]) {
+      newBoard[targetSetIdx].push(...actualTilesToMove);
+      newBoard[targetSetIdx] = autoSortSet(newBoard[targetSetIdx]);
+    } else {
+      newBoard.push(autoSortSet([...actualTilesToMove]));
+    }
+
+    syncLocalMove(newBoard, newRack);
+    setSelectedTiles([]);
+  };
+
+  // --- DRAG AND DROP HANDLERS ---
+  const handleDragStart = (e, tile, source, setIdx = null) => {
+    if (!isMyTurn && source === 'board') {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.setData('application/json', JSON.stringify({ ...tile, source, setIdx }));
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault(); 
+  };
+
+  const handleDropOnTile = (e, targetTile, targetSource, targetSetIdx = null) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (!isMyTurn && targetSource === 'board') return;
+
+    try {
+      const data = e.dataTransfer.getData('application/json');
+      if (!data) return;
+      const draggedTile = JSON.parse(data);
+
+      if (!isMyTurn && draggedTile.source === 'board') return;
+      if (draggedTile.id === targetTile.id) return; 
+
+      const newBoard = cloneBoard(gameState.board);
+      let newRack = [...gameState.racks[socket.id]];
+
+      const actualDraggedTile = draggedTile.source === 'rack' 
+        ? newRack.find(t => t.id === draggedTile.id) 
+        : newBoard[draggedTile.setIdx]?.find(t => t.id === draggedTile.id);
+        
+      if (!actualDraggedTile) return;
+
+      if (targetSource === 'rack') {
+        const actualTargetTile = newRack.find(t => t.id === targetTile.id);
+        if (!actualTargetTile) return;
+
+        if (draggedTile.source === 'rack') {
+          setRackSortType(null); // Clear auto-sort when manually dragging in rack (Rule #4)
+          const idx1 = newRack.findIndex(t => t.id === draggedTile.id);
+          const idx2 = newRack.findIndex(t => t.id === targetTile.id);
+          newRack[idx1] = actualTargetTile;
+          newRack[idx2] = actualDraggedTile;
+          syncRackLocal(newRack);
+        } else {
+          // Cannot swap board to rack (Rule #5)
+          return;
+        }
+      } else {
+        if (draggedTile.source === 'rack') {
+          newRack = newRack.filter(t => t.id !== draggedTile.id);
+        } else {
+          newBoard[draggedTile.setIdx] = newBoard[draggedTile.setIdx].filter(t => t.id !== draggedTile.id);
+        }
+
+        newBoard[targetSetIdx].push(actualDraggedTile);
+        newBoard[targetSetIdx] = autoSortSet(newBoard[targetSetIdx]);
+
+        removeEmptySets(newBoard);
+        syncLocalMove(newBoard, newRack);
+      }
+    } catch(err) { console.error("Drop err", err); }
+  };
+
+  const handleDropInGap = (e, setIdx, insertAfterIdx) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isMyTurn) return;
+
+    try {
+      const data = e.dataTransfer.getData('application/json');
+      if (!data) return;
+      const draggedTile = JSON.parse(data);
+
+      const newBoard = cloneBoard(gameState.board);
+      let newRack = [...gameState.racks[socket.id]];
+
+      const actualTile = draggedTile.source === 'rack'
+        ? newRack.find(t => t.id === draggedTile.id)
+        : newBoard[draggedTile.setIdx]?.find(t => t.id === draggedTile.id);
+
+      if (!actualTile) return;
+
+      if (draggedTile.source === 'rack') {
+        newRack = newRack.filter(t => t.id !== draggedTile.id);
+      } else {
+        newBoard[draggedTile.setIdx] = newBoard[draggedTile.setIdx].filter(t => t.id !== draggedTile.id);
+      }
+
+      if (newBoard[setIdx]) {
+        let insertPosition = insertAfterIdx + 1;
+        if (draggedTile.source === 'board' && draggedTile.setIdx === setIdx) {
+          const originalIdx = gameState.board[setIdx].findIndex(t => t.id === draggedTile.id);
+          if (originalIdx !== -1 && originalIdx <= insertAfterIdx) {
+            insertPosition--;
+          }
+        }
+        newBoard[setIdx].splice(Math.max(0, insertPosition), 0, actualTile);
+      }
+
+      removeEmptySets(newBoard);
+      syncLocalMove(newBoard, newRack);
+    } catch(err) { console.error(err); }
+  };
+
+  const handleDropOnSet = (e, setIdx) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isMyTurn) return;
+
+    try {
+      const data = e.dataTransfer.getData('application/json');
+      if (!data) return;
+      const draggedTile = JSON.parse(data);
+
+      if (draggedTile.source === 'board' && draggedTile.setIdx === setIdx) return;
+
+      const newBoard = cloneBoard(gameState.board);
+      let newRack = [...gameState.racks[socket.id]];
+
+      const actualTile = draggedTile.source === 'rack'
+        ? newRack.find(t => t.id === draggedTile.id)
+        : newBoard[draggedTile.setIdx]?.find(t => t.id === draggedTile.id);
+
+      if (!actualTile) return;
+
+      if (draggedTile.source === 'rack') {
+        newRack = newRack.filter(t => t.id !== draggedTile.id);
+      } else {
+        newBoard[draggedTile.setIdx] = newBoard[draggedTile.setIdx].filter(t => t.id !== draggedTile.id);
+      }
+
+      if (newBoard[setIdx]) {
+        newBoard[setIdx].push(actualTile);
+        newBoard[setIdx] = autoSortSet(newBoard[setIdx]);
+      }
+
+      removeEmptySets(newBoard);
+      syncLocalMove(newBoard, newRack);
+    } catch(err) { console.error(err); }
+  };
+
+  const handleDropOnBoardEmpty = (e) => {
+    e.preventDefault();
+    if (!isMyTurn) return;
+
+    try {
+      const data = e.dataTransfer.getData('application/json');
+      if (!data) return;
+      const draggedTile = JSON.parse(data);
+
+      const newBoard = cloneBoard(gameState.board);
+      let newRack = [...gameState.racks[socket.id]];
+
+      const actualTile = draggedTile.source === 'rack'
+        ? newRack.find(t => t.id === draggedTile.id)
+        : newBoard[draggedTile.setIdx]?.find(t => t.id === draggedTile.id);
+
+      if (!actualTile) return;
+
+      if (draggedTile.source === 'rack') {
+        newRack = newRack.filter(t => t.id !== draggedTile.id);
+      } else {
+        newBoard[draggedTile.setIdx] = newBoard[draggedTile.setIdx].filter(t => t.id !== draggedTile.id);
+      }
+
+      newBoard.push([actualTile]);
+
+      removeEmptySets(newBoard);
+      syncLocalMove(newBoard, newRack);
+    } catch(err) { console.error(err); }
+  };
+
+  const splitSet = (e, setIdx, splitAfterIndex) => {
+    e.stopPropagation(); // Rule #2
+    if (!isMyTurn) return;
+
+    const newBoard = cloneBoard(gameState.board);
+    const set = newBoard[setIdx];
+    
+    const set1 = set.slice(0, splitAfterIndex + 1);
+    const set2 = set.slice(splitAfterIndex + 1);
+    
+    newBoard.splice(setIdx, 1, set1, set2);
+    
+    syncLocalMove(newBoard, gameState.racks[socket.id]);
+    setSelectedTiles([]);
+  };
+
+  const sortRack = (type) => {
+    setRackSortType(type);
+    const sortedRack = sortRackTiles(gameState.racks[socket.id], type);
+    syncRackLocal(sortedRack);
+  };
+
+  const endTurn = () => {
+    setSelectedTiles([]);
+    socket.emit('endTurn', { roomCode }, (res) => {
+      if (!res.success) {
+        setErrorMsg(res.message);
+      } else {
+        setMoveHistory([]);
+      }
+    });
+  };
+
+  const revertTurn = () => {
+    setSelectedTiles([]);
+    setErrorMsg(null);
+    setMoveHistory([]);
+    socket.emit('revertTurn', { roomCode });
+  };
+
+  const drawTile = () => {
+    setSelectedTiles([]);
+    setErrorMsg(null);
+    setMoveHistory([]);
+    socket.emit('drawTile', { roomCode });
+  };
+
+  const sendReaction = (emoji) => {
+    socket.emit('reaction', { roomCode, emoji });
+    setShowReactionPicker(false);
+  };
+
+  // Render pre-game lobby if game has not started
+  if (!gameState) {
+    return (
+      <Lobby
+        roomCode={roomCode}
+        players={players}
+        host={host}
+        socketId={socket.id}
+        config={config}
+        lobbyTimeout={lobbyTimeout}
+        onTimeoutChange={(val) => {
+          setLobbyTimeout(val);
+          updateConfig('turnTimeout', val);
+        }}
+        onStartGame={startGame}
+      />
+    );
+  }
+
+  const myRack = gameState.racks[socket.id] || [];
+  const currentPlayerId = gameState.playerIds[gameState.currentTurnIndex];
+
+  return (
+    <div className="game-container" style={{ flexDirection: 'column' }}>
+      <FloatingReactions reactions={reactions} />
+
+      <ErrorMessage 
+        errorMsg={errorMsg} 
+        onClose={() => setErrorMsg(null)} 
+      />
+
+      <GameHeader
+        roomCode={roomCode}
+        players={players}
+        currentPlayerId={currentPlayerId}
+        gameState={gameState}
+        turnTimeLeft={turnTimeLeft}
+        showReactionPicker={showReactionPicker}
+        onToggleReactionPicker={() => setShowReactionPicker(!showReactionPicker)}
+        onSendReaction={sendReaction}
+      />
+
+      <Board
+        board={gameState.board}
+        selectedTiles={selectedTiles}
+        isMyTurn={isMyTurn}
+        onBoardClick={handleBoardClick}
+        onDragOver={handleDragOver}
+        onDropOnBoardEmpty={handleDropOnBoardEmpty}
+        onMoveSelectedToNewSet={() => moveSelectedTilesToSet(null)}
+        onSetClick={handleSetClick}
+        onTileClick={handleTileClick}
+        onDragStart={handleDragStart}
+        onDropOnSet={handleDropOnSet}
+        onDropOnTile={handleDropOnTile}
+        onDropInGap={handleDropInGap}
+        onSplitSet={splitSet}
+      />
+
+      <Rack
+        myRack={myRack}
+        selectedTiles={selectedTiles}
+        isMyTurn={isMyTurn}
+        hasMoveHistory={moveHistory.length > 0}
+        onSortRack={sortRack}
+        onClearSelection={() => setSelectedTiles([])}
+        onUndoMove={undoMove}
+        onSortBoard={sortBoard}
+        onDrawTile={drawTile}
+        onRevertTurn={revertTurn}
+        onEndTurn={endTurn}
+        onTileClick={handleTileClick}
+        onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
+        onDropOnTile={handleDropOnTile}
+      />
+    </div>
+  );
+}
+import { useState } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { getPersistentId } from '../utils/persistentId';
+
+export default function Home({ socket }) {
+  const { roomCode: urlRoomCode } = useParams();
+  const navigate = useNavigate();
+  const [name, setName] = useState(localStorage.getItem('rummi-name') || '');
+  const [roomCode, setRoomCode] = useState(urlRoomCode || '');
+  const [avatar, setAvatar] = useState(localStorage.getItem('rummi-avatar') || '🦊');
+
+  const saveName = (n) => { setName(n); localStorage.setItem('rummi-name', n); };
+  const saveAvatar = (a) => { setAvatar(a); localStorage.setItem('rummi-avatar', a); };
+
+  const handleCreate = () => {
+    if (!name) return alert('Please enter a name');
+    socket.emit('createRoom', { name, avatar, persistentId: getPersistentId() }, (response) => {
+      if (response.success) {
+        navigate(`/room/${response.roomCode}`);
+      }
+    });
+  };
+
+  const handleJoin = () => {
+    if (!name) return alert('Please enter a name');
+    if (!roomCode) return alert('Please enter a room code');
+    socket.emit('joinRoom', { roomCode: roomCode.toUpperCase(), name, avatar, persistentId: getPersistentId() }, (response) => {
+      if (response.success) {
+        navigate(`/room/${roomCode.toUpperCase()}`);
+      } else {
+        alert(response.message || 'Error joining room');
+      }
+    });
+  };
+
+  return (
+    <div className="lobby-container">
+      <div className="lobby-card glass">
+        <h1 style={{ textAlign: 'center', margin: 0, fontSize: '2.5rem' }}>Rummikub</h1>
+        
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          <label>Your Name</label>
+          <input 
+            type="text" 
+            placeholder="Enter your name..." 
+            value={name} 
+            onChange={e => saveName(e.target.value)} 
+          />
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+          <label>Avatar</label>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '2rem' }}>
+            {['🦊', '🐼', '🐯', '🐸', '🦄'].map(emoji => (
+              <div 
+                key={emoji}
+                onClick={() => saveAvatar(emoji)}
+                style={{
+                  cursor: 'pointer',
+                  padding: '0.5rem',
+                  border: avatar === emoji ? '2px solid var(--primary)' : '2px solid transparent',
+                  borderRadius: '12px',
+                  background: avatar === emoji ? 'var(--surface)' : 'transparent'
+                }}
+              >
+                {emoji}
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {urlRoomCode ? (
+          <button onClick={handleJoin} style={{ marginTop: '1rem' }}>
+            Join Room {urlRoomCode.toUpperCase()}
+          </button>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '1rem' }}>
+            <button onClick={handleCreate}>Create New Game</button>
+            <div style={{ display: 'flex', gap: '0.5rem' }}>
+              <input 
+                type="text" 
+                placeholder="Room Code" 
+                value={roomCode} 
+                onChange={e => setRoomCode(e.target.value.toUpperCase())}
+                style={{ flex: 1 }}
+                maxLength={4}
+              />
+              <button onClick={handleJoin} style={{ background: 'var(--surface-border)' }}>Join</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+import { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
+
+/**
+ * Custom hook to encapsulate game socket event subscriptions and state
+ */
+export function useGameSocket(socket) {
+  const navigate = useNavigate();
+  const [players, setPlayers] = useState([]);
+  const [host, setHost] = useState(null);
+  const [gameState, setGameState] = useState(null);
+  const [config, setConfig] = useState({ turnTimeout: 0 });
+  const [reactions, setReactions] = useState([]);
+  const reactionIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!socket.connected) {
+      navigate('/');
+      return;
+    }
+
+    const handleRoomUpdate = (data) => {
+      setPlayers(data.players);
+      setHost(data.host);
+      setGameState(data.gameState);
+      if (data.config) setConfig(data.config);
+    };
+
+    const handleBoardSync = (data) => {
+      if (data.turnOf !== socket.id) {
+        setGameState(prev => {
+          if (!prev) return prev;
+          return { ...prev, board: data.board };
+        });
+      }
+    };
+
+    const handleReaction = (data) => {
+      const id = reactionIdRef.current++;
+      setReactions(prev => [...prev, { ...data, id }]);
+      setTimeout(() => {
+        setReactions(prev => prev.filter(r => r.id !== id));
+      }, 3000);
+    };
+
+    socket.on('roomUpdate', handleRoomUpdate);
+    socket.on('boardSync', handleBoardSync);
+    socket.on('reaction', handleReaction);
+
+    return () => {
+      socket.off('roomUpdate', handleRoomUpdate);
+      socket.off('boardSync', handleBoardSync);
+      socket.off('reaction', handleReaction);
+    };
+  }, [socket, navigate]);
+
+  return {
+    players,
+    host,
+    gameState,
+    setGameState,
+    config,
+    reactions
+  };
+}
+import { useState, useEffect } from 'react';
+
+/**
+ * Custom hook to calculate and update turn timer countdown
+ */
+export function useTurnTimer(gameState) {
+  const [turnTimeLeft, setTurnTimeLeft] = useState(null);
+
+  const turnStartTime = gameState?.turnStartTime;
+  const turnTimeout = gameState?.turnTimeout;
+
+  useEffect(() => {
+    if (!turnTimeout || !turnStartTime) {
+      setTurnTimeLeft(null);
+      return;
+    }
+
+    const updateTimer = () => {
+      const elapsed = (Date.now() - turnStartTime) / 1000;
+      const remaining = Math.max(0, turnTimeout - elapsed);
+      setTurnTimeLeft(Math.ceil(remaining));
+    };
+
+    updateTimer();
+    const interval = setInterval(updateTimer, 500);
+    return () => clearInterval(interval);
+  }, [turnStartTime, turnTimeout]);
+
+  return turnTimeLeft;
+}
+import { useEffect, useRef } from 'react';
+import { sortRackTiles } from '../utils/gameUtils';
+
+/**
+ * Custom hook to enforce rack auto-sorting preference (Rule #4)
+ */
+export function useRackSort(gameState, socket, rackSortType, syncRackLocal) {
+  const currentRack = gameState?.racks?.[socket.id];
+  const rackTileIds = currentRack ? JSON.stringify(currentRack.map(t => t.id)) : '';
+  const syncRef = useRef(syncRackLocal);
+
+  useEffect(() => {
+    syncRef.current = syncRackLocal;
+  });
+
+  useEffect(() => {
+    if (!rackSortType || !currentRack || currentRack.length === 0) return;
+
+    const sorted = sortRackTiles(currentRack, rackSortType);
+    const sortedTileIds = JSON.stringify(sorted.map(t => t.id));
+
+    // Only sync if order changed to prevent infinite loops
+    if (rackTileIds !== sortedTileIds) {
+      syncRef.current(sorted);
+    }
+  }, [rackTileIds, currentRack, rackSortType]);
+}
+import TileSet from './TileSet';
+
+export default function Board({
+  board,
+  selectedTiles,
+  isMyTurn,
+  onBoardClick,
+  onDragOver,
+  onDropOnBoardEmpty,
+  onMoveSelectedToNewSet,
+  onSetClick,
+  onTileClick,
+  onDragStart,
+  onDropOnSet,
+  onDropOnTile,
+  onDropInGap,
+  onSplitSet
+}) {
+  return (
+    <div 
+      className="board-area glass" 
+      style={{ position: 'relative', flex: 1, minHeight: '300px' }}
+      onDragOver={onDragOver}
+      onDrop={onDropOnBoardEmpty}
+      onClick={onBoardClick}
+    >
+      {(!board || board.length === 0) && (
+        <p style={{ margin: 'auto', color: 'var(--text-muted)', pointerEvents: 'none' }}>
+          Board is empty
+        </p>
+      )}
+
+      {board && board.map((set, idx) => (
+        <TileSet 
+          key={idx}
+          set={set}
+          setIdx={idx}
+          selectedTiles={selectedTiles}
+          isMyTurn={isMyTurn}
+          onSetClick={onSetClick}
+          onTileClick={onTileClick}
+          onDragStart={onDragStart}
+          onDragOver={onDragOver}
+          onDropOnSet={onDropOnSet}
+          onDropOnTile={onDropOnTile}
+          onDropInGap={onDropInGap}
+          onSplitSet={onSplitSet}
+        />
+      ))}
+
+      {isMyTurn && selectedTiles.length > 0 && (
+        <div 
+          onClick={(e) => { 
+            e.stopPropagation(); 
+            onMoveSelectedToNewSet(); 
+          }}
+          style={{
+            padding: '1rem',
+            border: '2px dashed var(--color-orange)',
+            borderRadius: '8px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+            color: 'var(--color-orange)',
+            fontWeight: 'bold',
+            minWidth: '100px',
+            height: '60px'
+          }}
+        >
+          + New Set
+        </div>
+      )}
+    </div>
+  );
+}
+import Tile from './Tile';
+
+export default function TileSet({
+  set,
+  setIdx,
+  selectedTiles,
+  isMyTurn,
+  onSetClick,
+  onTileClick,
+  onDragStart,
+  onDragOver,
+  onDropOnSet,
+  onDropOnTile,
+  onDropInGap,
+  onSplitSet
+}) {
+  const isSelectedForTarget = selectedTiles.length > 0 && isMyTurn;
+
+  return (
+    <div 
+      className="tile-set"
+      onClick={(e) => { 
+        e.stopPropagation(); 
+        onSetClick(setIdx); 
+      }}
+      onDragOver={onDragOver}
+      onDrop={(e) => onDropOnSet(e, setIdx)}
+      style={{ 
+        cursor: isSelectedForTarget ? 'copy' : 'default',
+        border: isSelectedForTarget ? '1px dashed var(--primary)' : '1px solid transparent',
+        display: 'flex', alignItems: 'center',
+        padding: '16px 24px',
+        margin: '4px',
+        minHeight: '60px',
+        minWidth: '60px',
+        background: 'rgba(255, 255, 255, 0.03)',
+        borderRadius: '12px'
+      }}
+    >
+      {set.map((tile, tIdx) => (
+        <div key={tile.id} style={{ display: 'flex', alignItems: 'center' }}>
+          <Tile 
+            tile={tile} 
+            selected={!!selectedTiles.find(t => t.id === tile.id)}
+            onClick={(e) => onTileClick(e, tile, 'board', setIdx)} 
+            onDragStart={(e) => onDragStart(e, tile, 'board', setIdx)}
+            onDragOver={onDragOver}
+            onDrop={(e) => onDropOnTile(e, tile, 'board', setIdx)}
+          />
+          {tIdx < set.length - 1 && isMyTurn && (
+            <div 
+              className="tile-gap"
+              onClick={(e) => onSplitSet(e, setIdx, tIdx)}
+              onDragOver={onDragOver}
+              onDrop={(e) => onDropInGap(e, setIdx, tIdx)}
+              title="Click to split, drop here to insert"
+            />
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+import Tile from './Tile';
+import GameControls from './GameControls';
+
+export default function Rack({
+  myRack,
+  selectedTiles,
+  isMyTurn,
+  hasMoveHistory,
+  onSortRack,
+  onClearSelection,
+  onUndoMove,
+  onSortBoard,
+  onDrawTile,
+  onRevertTurn,
+  onEndTurn,
+  onTileClick,
+  onDragStart,
+  onDragOver,
+  onDropOnTile
+}) {
+  return (
+    <div className="glass" style={{ display: 'flex', flexDirection: 'column' }}>
+      <GameControls
+        isMyTurn={isMyTurn}
+        selectedTilesCount={selectedTiles.length}
+        hasMoveHistory={hasMoveHistory}
+        onSortRack={onSortRack}
+        onClearSelection={onClearSelection}
+        onUndoMove={onUndoMove}
+        onSortBoard={onSortBoard}
+        onDrawTile={onDrawTile}
+        onRevertTurn={onRevertTurn}
+        onEndTurn={onEndTurn}
+      />
+      <div 
+        className="rack-area" 
+        style={{ flexWrap: 'wrap', height: 'auto', minHeight: '120px' }}
+        onDragOver={onDragOver}
+      >
+        {myRack.map(tile => (
+          <Tile 
+            key={tile.id} 
+            tile={tile} 
+            selected={!!selectedTiles.find(t => t.id === tile.id)}
+            onClick={(e) => onTileClick(e, tile, 'rack')} 
+            onDragStart={(e) => onDragStart(e, tile, 'rack')}
+            onDragOver={onDragOver}
+            onDrop={(e) => onDropOnTile(e, tile, 'rack')}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+import ReactionPicker from './ReactionPicker';
+
+export default function GameHeader({
+  roomCode,
+  players,
+  currentPlayerId,
+  gameState,
+  turnTimeLeft,
+  showReactionPicker,
+  onToggleReactionPicker,
+  onSendReaction
+}) {
+  return (
+    <div className="glass" style={{ display: 'flex', gap: '1rem', padding: '0.5rem 1rem', alignItems: 'center', overflowX: 'auto' }}>
+      <h4 style={{ margin: 0, fontSize: '0.9rem', color: 'var(--text-muted)', textTransform: 'uppercase' }}>Room {roomCode}</h4>
+      
+      {players.map(p => (
+        <div key={p.id} style={{ 
+          display: 'flex', alignItems: 'center', gap: '0.4rem',
+          opacity: currentPlayerId === p.id ? 1 : (p.offline ? 0.3 : 0.6),
+          padding: '0.2rem 0.5rem',
+          background: currentPlayerId === p.id ? 'var(--surface)' : 'transparent',
+          borderRadius: '6px', fontSize: '0.85rem'
+        }}>
+          <span>{p.avatar}</span>
+          <span style={{ fontWeight: 'bold' }}>{p.name} {p.offline ? '📴' : ''}</span>
+          <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)' }}>({gameState.racks[p.id]?.length || 0})</span>
+        </div>
+      ))}
+
+      {turnTimeLeft !== null && turnTimeLeft > 0 && (
+        <div style={{ 
+          marginLeft: 'auto',
+          fontSize: '1.1rem', fontWeight: 'bold',
+          color: turnTimeLeft <= 10 ? 'var(--color-red)' : 'var(--text)',
+          padding: '0.2rem 0.5rem', borderRadius: '6px',
+          background: turnTimeLeft <= 10 ? 'rgba(220,38,38,0.15)' : 'transparent',
+          animation: turnTimeLeft <= 5 ? 'pulse 1s infinite' : 'none'
+        }}>
+          ⏱️ {turnTimeLeft}s
+        </div>
+      )}
+
+      <div style={{ marginLeft: turnTimeLeft !== null ? '0' : 'auto' }}>
+        <ReactionPicker 
+          show={showReactionPicker} 
+          onToggle={onToggleReactionPicker} 
+          onSelectEmoji={onSendReaction} 
+        />
+      </div>
+    </div>
+  );
+}
+export default function GameControls({
+  isMyTurn,
+  selectedTilesCount,
+  hasMoveHistory,
+  onSortRack,
+  onClearSelection,
+  onUndoMove,
+  onSortBoard,
+  onDrawTile,
+  onRevertTurn,
+  onEndTurn
+}) {
+  return (
+    <div style={{ padding: '0.5rem 1rem', display: 'flex', gap: '1rem', flexWrap: 'wrap', alignItems: 'center', background: 'rgba(0,0,0,0.2)', borderTopLeftRadius: '16px', borderTopRightRadius: '16px' }}>
+      <span style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>Sort:</span>
+      <button onClick={() => onSortRack('number')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>123</button>
+      <button onClick={() => onSortRack('color')} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)' }}>Color</button>
+      
+      {selectedTilesCount > 0 && (
+        <button onClick={onClearSelection} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'rgba(220,38,38,0.3)' }}>
+          Clear Selection ({selectedTilesCount})
+        </button>
+      )}
+
+      {isMyTurn && (
+        <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
+          {hasMoveHistory && (
+            <button onClick={onUndoMove} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--color-blue)' }}>↩ Undo</button>
+          )}
+          <button onClick={onSortBoard} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface-border)', color: 'var(--text)' }}>Sort Sets</button>
+          <button onClick={onDrawTile} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--surface)' }}>Draw Tile</button>
+          <button onClick={onRevertTurn} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--color-orange)' }}>Revert All</button>
+          <button onClick={onEndTurn} style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem', background: 'var(--primary)' }}>End Turn</button>
+        </div>
+      )}
+    </div>
+  );
+}
+export default function Tile({ tile, onClick, selected, onDragStart, onDragOver, onDrop }) {
+  if (!tile) return null;
+  
+  const isJoker = tile.isJoker;
+  const colorClass = tile.color ? tile.color : 'joker';
+  
+  return (
+    <div 
+      className={`tile ${colorClass}`} 
+      onClick={(e) => onClick && onClick(e, tile)}
+      draggable={!!onDragStart}
+      onDragStart={(e) => onDragStart && onDragStart(e, tile)}
+      onDragOver={onDragOver}
+      onDrop={(e) => onDrop && onDrop(e, tile)}
+      style={{
+        border: selected ? '2px solid var(--primary)' : '1px solid var(--tile-border)',
+        transform: selected ? 'translateY(-5px)' : 'none'
+      }}
+    >
+      {isJoker ? '☻' : tile.number}
+    </div>
+  );
+}
+// Utility functions for Rummikub tile & board operations
+
+/**
+ * Deep clone board array of sets (Rule #1: State Immutability & Deep Cloning)
+ */
+export const cloneBoard = (board) => (board ? board.map(set => [...set]) : []);
+
+/**
+ * Automatically sort a set (group vs run with jokers)
+ */
+export const autoSortSet = (set) => {
+  if (!set || set.length <= 1) return set;
+  const realTiles = set.filter(t => !t.isJoker);
+  const jokers = set.filter(t => t.isJoker);
+  
+  if (realTiles.length <= 1) {
+    return [...realTiles, ...jokers];
+  }
+  
+  const isGroup = realTiles.every(t => t.number === realTiles[0].number);
+  if (isGroup) {
+    realTiles.sort((a, b) => (a.color || '').localeCompare(b.color || ''));
+    return [...realTiles, ...jokers];
+  } else {
+    realTiles.sort((a, b) => a.number - b.number);
+    const sortedRun = [];
+    let expectedNumber = realTiles[0].number;
+    
+    for (let tile of realTiles) {
+      while (expectedNumber < tile.number && jokers.length > 0) {
+        sortedRun.push(jokers.shift());
+        expectedNumber++;
+      }
+      sortedRun.push(tile);
+      expectedNumber = tile.number + 1;
+    }
+    sortedRun.push(...jokers);
+    return sortedRun;
+  }
+};
+
+/**
+ * Remove empty sets in-place from board array
+ */
+export const removeEmptySets = (board) => {
+  for (let i = board.length - 1; i >= 0; i--) {
+    if (board[i].length === 0) board.splice(i, 1);
+  }
+};
+
+/**
+ * Sort rack tiles by 'number' or 'color'
+ */
+export const sortRackTiles = (rack, type) => {
+  if (!rack) return [];
+  const sorted = [...rack];
+  if (type === 'number') {
+    sorted.sort((a, b) => {
+      if (a.isJoker) return 1;
+      if (b.isJoker) return -1;
+      if (a.number === b.number) return a.color.localeCompare(b.color);
+      return a.number - b.number;
+    });
+  } else if (type === 'color') {
+    sorted.sort((a, b) => {
+      if (a.isJoker) return 1;
+      if (b.isJoker) return -1;
+      if (a.color === b.color) return a.number - b.number;
+      return a.color.localeCompare(b.color);
+    });
+  }
+  return sorted;
+};
+export const REACTION_EMOJIS = ['😂', '🔥', '👏', '😱', '💀', '🎉', '😤', '🤔'];
+// Utility for managing player's persistent identity across browser sessions
+export const getPersistentId = () => {
+  let id = localStorage.getItem('rummi-pid');
+  if (!id) {
+    id = 'p-' + Math.random().toString(36).substring(2, 12);
+    localStorage.setItem('rummi-pid', id);
+  }
+  return id;
+};

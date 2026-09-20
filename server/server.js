@@ -133,19 +133,25 @@ io.on('connection', (socket) => {
         // Migrate rack
         if (gs.racks[oldSocketId]) {
           gs.racks[socket.id] = gs.racks[oldSocketId];
-          delete gs.racks[oldSocketId];
+          if (oldSocketId !== socket.id) {
+            delete gs.racks[oldSocketId];
+          }
         }
 
         // Migrate playerIds array
-        const pidx = gs.playerIds.indexOf(oldSocketId);
-        if (pidx !== -1) {
-          gs.playerIds[pidx] = socket.id;
+        if (oldSocketId !== socket.id) {
+          const pidx = gs.playerIds.indexOf(oldSocketId);
+          if (pidx !== -1) {
+            gs.playerIds[pidx] = socket.id;
+          }
         }
 
         // Migrate initialMeldCompleted
         if (gs.initialMeldCompleted[oldSocketId] !== undefined) {
           gs.initialMeldCompleted[socket.id] = gs.initialMeldCompleted[oldSocketId];
-          delete gs.initialMeldCompleted[oldSocketId];
+          if (oldSocketId !== socket.id) {
+            delete gs.initialMeldCompleted[oldSocketId];
+          }
         }
 
         // Migrate snapshot rack if it belongs to the reconnecting player
@@ -160,7 +166,9 @@ io.on('connection', (socket) => {
       }
 
       // Remove old player entry
-      delete room.players[oldSocketId];
+      if (oldSocketId !== socket.id) {
+        delete room.players[oldSocketId];
+      }
       if (room.host === oldSocketId) {
         room.host = socket.id;
       }
@@ -191,7 +199,7 @@ io.on('connection', (socket) => {
 
   socket.on('updateBoardLocal', ({ roomCode, board, rack }) => {
     const room = rooms[roomCode];
-    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id && !room.gameState.gameOver) {
       room.gameState.board = board;
       room.gameState.racks[socket.id] = rack;
       socket.to(roomCode).emit('boardSync', { board, turnOf: socket.id });
@@ -200,14 +208,14 @@ io.on('connection', (socket) => {
 
   socket.on('updateRack', ({ roomCode, rack }) => {
     const room = rooms[roomCode];
-    if (room && room.gameState && room.gameState.racks[socket.id]) {
+    if (room && room.gameState && room.gameState.racks[socket.id] && !room.gameState.gameOver) {
       room.gameState.racks[socket.id] = rack;
     }
   });
 
   socket.on('revertTurn', ({ roomCode }) => {
     const room = rooms[roomCode];
-    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id && !room.gameState.gameOver) {
       room.gameState.revertToSnapshot();
       broadcastRoom(roomCode);
     }
@@ -215,13 +223,12 @@ io.on('connection', (socket) => {
 
   socket.on('endTurn', ({ roomCode }, callback) => {
     const room = rooms[roomCode];
-    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id && !room.gameState.gameOver) {
       const gs = room.gameState;
       const validation = GameState.isBoardValid(gs.board);
       if (validation.valid) {
         const boardUnchanged = JSON.stringify(gs.board) === JSON.stringify(gs.snapshot.board);
-        const rackUnchanged = JSON.stringify(gs.racks[socket.id]) === JSON.stringify(gs.snapshot.rack);
-        if (boardUnchanged && rackUnchanged) {
+        if (boardUnchanged) {
           const newTile = gs.drawTile();
           if (newTile) {
             gs.racks[socket.id].push(newTile);
@@ -229,8 +236,11 @@ io.on('connection', (socket) => {
         }
 
         if (gs.racks[socket.id].length === 0) {
-          gs.winner = socket.id;
+          const player = room.players[socket.id];
+          gs.gameOver = true;
+          gs.winner = { id: player.id, name: player.name, avatar: player.avatar };
           clearTurnTimer(roomCode);
+          io.to(roomCode).emit('gameOver', { winner: gs.winner, reason: 'empty_rack' });
         } else {
           gs.nextTurn();
           gs.createSnapshot();
@@ -246,7 +256,7 @@ io.on('connection', (socket) => {
 
   socket.on('drawTile', ({ roomCode }) => {
     const room = rooms[roomCode];
-    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id) {
+    if (room && room.gameState && room.gameState.getCurrentPlayerId() === socket.id && !room.gameState.gameOver) {
       room.gameState.revertToSnapshot();
       const tile = room.gameState.drawTile();
       if (tile) {
@@ -256,6 +266,16 @@ io.on('connection', (socket) => {
       room.gameState.createSnapshot();
       startTurnTimer(roomCode);
       broadcastRoom(roomCode);
+    }
+  });
+
+  socket.on('restartGame', ({ roomCode }) => {
+    const room = rooms[roomCode];
+    if (room && room.host === socket.id) {
+      room.gameState = new GameState(Object.keys(room.players), { turnTimeout: room.config.turnTimeout });
+      room.gameState.createSnapshot();
+      broadcastRoom(roomCode);
+      startTurnTimer(roomCode);
     }
   });
 

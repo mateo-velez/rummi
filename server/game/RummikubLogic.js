@@ -82,14 +82,15 @@ class GameState {
     // Deep clone the board and current player's rack
     this.snapshot = {
       board: JSON.parse(JSON.stringify(this.board)),
-      rack: JSON.parse(JSON.stringify(this.racks[this.getCurrentPlayerId()]))
+      rack: JSON.parse(JSON.stringify(this.racks[this.getCurrentPlayerId()])),
+      rackPlayerId: this.getCurrentPlayerId()
     };
   }
 
   revertToSnapshot() {
     if (this.snapshot) {
       this.board = JSON.parse(JSON.stringify(this.snapshot.board));
-      this.racks[this.getCurrentPlayerId()] = JSON.parse(JSON.stringify(this.snapshot.rack));
+      this.racks[this.snapshot.rackPlayerId] = JSON.parse(JSON.stringify(this.snapshot.rack));
       // Do not clear the snapshot, allowing multiple reverts in a turn
     }
   }

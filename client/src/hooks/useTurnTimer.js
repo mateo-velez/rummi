@@ -10,7 +10,7 @@ export function useTurnTimer(gameState) {
   const turnTimeout = gameState?.turnTimeout;
 
   useEffect(() => {
-    if (!turnTimeout || !turnStartTime) {
+    if (!turnTimeout || !turnStartTime || gameState?.gameOver) {
       setTurnTimeLeft(null);
       return;
     }
@@ -24,7 +24,7 @@ export function useTurnTimer(gameState) {
     updateTimer();
     const interval = setInterval(updateTimer, 500);
     return () => clearInterval(interval);
-  }, [turnStartTime, turnTimeout]);
+  }, [turnStartTime, turnTimeout, gameState?.gameOver]);
 
   return turnTimeLeft;
 }

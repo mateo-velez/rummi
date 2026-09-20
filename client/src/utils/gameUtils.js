@@ -22,6 +22,9 @@ export const autoSortSet = (set) => {
     realTiles.sort((a, b) => (a.color || '').localeCompare(b.color || ''));
     return [...realTiles, ...jokers];
   } else {
+    // Edge case: Jokers in runs depend on manual placement, so we preserve the original order if a joker is present.
+    if (set.some(t => t.isJoker)) return [...set];
+
     realTiles.sort((a, b) => a.number - b.number);
     const sortedRun = [];
     let expectedNumber = realTiles[0].number;

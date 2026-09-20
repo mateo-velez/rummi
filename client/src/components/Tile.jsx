@@ -7,7 +7,10 @@ export default function Tile({ tile, onClick, selected, onDragStart, onDragOver,
   return (
     <div 
       className={`tile ${colorClass}`} 
-      onClick={(e) => onClick && onClick(e, tile)}
+      onClick={(e) => {
+        e.stopPropagation();
+        if (onClick) onClick(e, tile);
+      }}
       draggable={!!onDragStart}
       onDragStart={(e) => onDragStart && onDragStart(e, tile)}
       onDragOver={onDragOver}

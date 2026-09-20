@@ -11,6 +11,7 @@ export function useGameSocket(socket) {
   const [gameState, setGameState] = useState(null);
   const [config, setConfig] = useState({ turnTimeout: 0 });
   const [reactions, setReactions] = useState([]);
+  const [gameOverInfo, setGameOverInfo] = useState(null);
   const reactionIdRef = useRef(0);
 
   useEffect(() => {
@@ -24,6 +25,11 @@ export function useGameSocket(socket) {
       setHost(data.host);
       setGameState(data.gameState);
       if (data.config) setConfig(data.config);
+      if (data.gameState?.gameOver) {
+        setGameOverInfo({ winner: data.gameState.winner, reason: 'empty_rack' });
+      } else {
+        setGameOverInfo(null);
+      }
     };
 
     const handleBoardSync = (data) => {
@@ -43,14 +49,20 @@ export function useGameSocket(socket) {
       }, 3000);
     };
 
+    const handleGameOver = (data) => {
+      setGameOverInfo(data);
+    };
+
     socket.on('roomUpdate', handleRoomUpdate);
     socket.on('boardSync', handleBoardSync);
     socket.on('reaction', handleReaction);
+    socket.on('gameOver', handleGameOver);
 
     return () => {
       socket.off('roomUpdate', handleRoomUpdate);
       socket.off('boardSync', handleBoardSync);
       socket.off('reaction', handleReaction);
+      socket.off('gameOver', handleGameOver);
     };
   }, [socket, navigate]);
 
@@ -60,6 +72,8 @@ export function useGameSocket(socket) {
     gameState,
     setGameState,
     config,
-    reactions
+    reactions,
+    gameOverInfo,
+    setGameOverInfo
   };
 }
